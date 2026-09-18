@@ -11,7 +11,8 @@ from fastapi.staticfiles import StaticFiles
 from .config import settings
 from .database import Base, engine
 from .models import BizError
-from .routers import auth, clients, declarations, dashboard
+from .routers import auth, clients, declarations, dashboard, inspections
+from .migrate import run_migrations
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("baoguantong")
@@ -30,10 +31,11 @@ app.add_middleware(
 
 @app.exception_handler(BizError)
 async def biz_error_handler(request: Request, exc: BizError):
-    """所有业务拦截统一结构：{error: {code, reason}}，前端直接把 reason 展示给用户。"""
+    """所有业务拦截统一结构：{error: {code, reason, details}}，
+    details 为排期冲突等结构化明细，前端可逐条标红、点开看原因。"""
     return JSONResponse(
         status_code=exc.status_code,
-        content={"error": {"code": exc.code, "reason": exc.reason}},
+        content={"error": {"code": exc.code, "reason": exc.reason, "details": exc.details}},
     )
 
 
@@ -50,6 +52,7 @@ app.include_router(auth.router, prefix="/api")
 app.include_router(clients.router, prefix="/api")
 app.include_router(declarations.router, prefix="/api")
 app.include_router(dashboard.router, prefix="/api")
+app.include_router(inspections.router, prefix="/api")
 
 
 @app.get("/api/health")
@@ -59,6 +62,8 @@ def health():
 
 @app.on_event("startup")
 def on_startup():
+    # 先建表 + 轻量迁移（补列 / users 枚举重建），再播种
+    run_migrations()
     Base.metadata.create_all(bind=engine)
     if settings.SEED_ON_STARTUP:
         from .seed import seed_if_empty

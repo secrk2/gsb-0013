@@ -104,7 +104,7 @@ def overview(user: User = Depends(get_current_user), db: Session = Depends(get_d
     schedule = []
     for i in inspections:
         item = inspection_out(i)
-        item["overdue"] = i.status in ("pending", "inspecting", "abnormal") and i.scheduled_at < now
+        item["overdue"] = i.status in ("scheduled", "inspecting", "abnormal") and i.scheduled_at < now
         item["mine"] = (user.role == Role.BROKER and i.declaration.broker_id == user.id)
         schedule.append(item)
 
@@ -119,11 +119,11 @@ def overview(user: User = Depends(get_current_user), db: Session = Depends(get_d
             "tax_unpaid": unpaid_count,
             "inspection_today": sum(
                 1 for i in inspections
-                if i.status in ("pending", "inspecting") and i.scheduled_at.date() == now.date()
+                if i.status in ("scheduled", "inspecting") and i.scheduled_at.date() == now.date()
             ),
             "inspection_overdue": sum(
                 1 for i in inspections
-                if i.status in ("pending", "inspecting", "abnormal") and i.scheduled_at < now
+                if i.status in ("scheduled", "inspecting", "abnormal") and i.scheduled_at < now
             ),
         },
         "tax_warning_days": TAX_WARNING_DAYS,

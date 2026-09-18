@@ -73,9 +73,72 @@ class RevealNameIn(BaseModel):
 
 class InspectionCreateIn(BaseModel):
     declaration_id: int
+    yard_id: int
+    bay_id: int
+    inspector_id: int
     scheduled_at: datetime
-    port: str
-    bay: str = ""
+    scheduled_end: datetime | None = None  # 缺省按默认时长补齐
+    duration_minutes: int = 120
+    due_at: datetime | None = None         # 应查验日（缺省=计划开始时间）
+    # 落点超出场站作业时段/排期窗口时，必须二次确认并填原因（留痕 window_override）
+    window_confirmed: bool = False
+    window_reason: str = ""
+    remark: str = ""
+
+
+class InspectionMoveIn(BaseModel):
+    """拖拽改期/直接改派（不触发链式：只动当前单）。"""
+    scheduled_at: datetime
+    scheduled_end: datetime | None = None
+    bay_id: int | None = None
+    inspector_id: int | None = None
+    expected_version: int | None = None
+    window_confirmed: bool = False
+    window_reason: str = ""
+
+
+class ReassignPreviewIn(BaseModel):
+    """车故障/人请假：从当前单解绑重排的预览入参。"""
+    new_scheduled_at: datetime
+    new_bay_id: int | None = None        # 缺省=同场站自动找合规车位
+    new_inspector_id: int | None = None  # 缺省=自动找合规查验员
+    duration_minutes: int = 120
+    reason_type: Literal["bay_broken", "inspector_leave", "manual"] = "manual"
+    reason: str = ""
+    # 故障车位 / 请假查验员若未显式给新资源，自动加入禁用集合
+    disable_bay_id: int | None = None
+    disable_inspector_id: int | None = None
+
+
+class ReassignConfirmIn(BaseModel):
+    """改派确认：提交预览返回的批次方案；服务端重新推演一遍，不信客户端回传的方案。"""
+    new_scheduled_at: datetime
+    new_bay_id: int | None = None
+    new_inspector_id: int | None = None
+    duration_minutes: int = 120
+    reason_type: Literal["bay_broken", "inspector_leave", "manual"] = "manual"
+    reason: str = Field(min_length=5, max_length=400, description="改派原因，必填≥5字并留痕")
+    disable_bay_id: int | None = None
+    disable_inspector_id: int | None = None
+    mark_resource_unavailable: bool = False  # 是否同步把故障车位/请假查验员置停用
+
+
+class InspectionCancelIn(BaseModel):
+    reason: str = Field(min_length=5, max_length=400, description="取消原因必填并留痕")
+
+
+class InspectionFinishIn(BaseModel):
+    result: str = "查验无误"
+    abnormal: bool = False
+
+
+class ReviewDecisionIn(BaseModel):
+    declaration_id: int
+    result: Literal["pass_inspect", "release", "return"] = "pass_inspect"
+    document_ok: bool = True
+    logic_ok: bool = True
+    risk_tags: str = ""
+    opinion: str = ""
 
 
 # ---------- 输出序列化 ----------
@@ -172,18 +235,108 @@ def declaration_out(d, *, can_see_full_name: bool = False) -> dict:
 
 
 def inspection_out(i) -> dict:
+    decl_status = i.declaration.status
     return {
         "id": i.id,
         "declaration_id": i.declaration_id,
         "decl_no": i.declaration.decl_no,
+        "decl_status": decl_status.value,
+        "decl_status_label": STATUS_LABELS[decl_status],
+        "enterprise_id": i.declaration.enterprise_id,
         "enterprise_name": i.declaration.enterprise.name_short,
         "scheduled_at": i.scheduled_at.isoformat(timespec="minutes"),
+        "scheduled_end": (i.scheduled_end or i.scheduled_at).isoformat(timespec="minutes"),
+        "due_at": i.due_at.isoformat(timespec="minutes") if i.due_at else None,
+        "finished_at": i.finished_at.isoformat(timespec="minutes") if i.finished_at else None,
+        "yard_id": i.yard_id,
+        "yard_name": i.yard.name if i.yard else None,
+        "bay_id": i.bay_id,
         "port": i.port,
-        "bay": i.bay,
+        "bay": (i.bay_ref.name if i.bay_ref else None) or i.bay,
+        "bay_cert_tags": [t for t in (i.bay_ref.cert_tags.split(",") if i.bay_ref else []) if t],
+        "inspector_id": i.inspector_id,
+        "inspector_name": i.inspector.display_name if i.inspector else None,
+        "inspector_certs": [t.strip() for t in ((i.inspector.inspector_certs or "").split(",")) if t.strip()]
+                           if i.inspector else [],
         "status": i.status,
-        "status_label": {"pending": "待查验", "inspecting": "查验中", "done": "已完成", "abnormal": "异常"}.get(i.status, i.status),
+        "status_label": {
+            "scheduled": "待查验", "inspecting": "查验中", "done": "已完成",
+            "abnormal": "异常", "cancelled": "已取消",
+        }.get(i.status, i.status),
         "result_note": i.result_note,
         "cargo_name": i.declaration.cargo_name,
+        "hs_code": i.declaration.hs_code,
+        "required_certs": [t.strip() for t in (i.required_certs or "normal").split(",") if t.strip()],
+        "version": i.version,
+        "reassign_batch_id": i.reassign_batch_id,
+        # 终态保护标记：前端据此禁用拖拽/改派
+        "locked": decl_status in (DeclStatus.RELEASED, DeclStatus.CLOSED),
+    }
+
+
+def yard_out(y, *, with_bays: bool = True, with_inspectors: bool = True) -> dict:
+    data = {
+        "id": y.id,
+        "code": y.code,
+        "name": y.name,
+        "port": y.port,
+        "address": y.address,
+        "open_hour": y.open_hour,
+        "close_hour": y.close_hour,
+        "horizon_days": y.horizon_days,
+    }
+    if with_bays:
+        data["bays"] = [bay_out(b) for b in y.bays]
+    if with_inspectors:
+        data["inspectors"] = [
+            {
+                "id": u.id,
+                "display_name": u.display_name,
+                "certs": [t.strip() for t in (u.inspector_certs or "").split(",") if t.strip()],
+                "available": u.available,
+                "unavailable_reason": u.unavailable_reason or None,
+            }
+            for u in y.inspectors
+        ]
+    return data
+
+
+def bay_out(b) -> dict:
+    return {
+        "id": b.id,
+        "yard_id": b.yard_id,
+        "code": b.code,
+        "name": b.name or b.code,
+        "cert_tags": [t.strip() for t in (b.cert_tags or "normal").split(",") if t.strip()],
+        "seq": b.seq,
+        "out_of_service": b.out_of_service,
+        "out_of_service_reason": b.out_of_service_reason or None,
+    }
+
+
+def schedule_log_out(lg) -> dict:
+    import json
+    detail = None
+    if lg.detail:
+        try:
+            detail = json.loads(lg.detail)
+        except Exception:
+            detail = lg.detail
+    return {
+        "id": lg.id,
+        "inspection_id": lg.inspection_id,
+        "declaration_id": lg.declaration_id,
+        "actor_name": lg.actor_name,
+        "action": lg.action,
+        "action_label": {
+            "create": "创建排期", "move": "拖拽改期", "reassign": "解绑改派",
+            "chain_move": "链式顺延", "cancel": "取消排期", "finish": "登记结果",
+            "window_override": "超窗口确认",
+        }.get(lg.action, lg.action),
+        "reassign_batch_id": lg.reassign_batch_id,
+        "reason": lg.reason,
+        "detail": detail,
+        "created_at": lg.created_at.isoformat(timespec="seconds"),
     }
 
 

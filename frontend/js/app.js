@@ -83,6 +83,14 @@
     });
   }
 
+  /* 零构建多文件扩展点：供 inspections.js 注册路由、复用主框架 UI */
+  window.BGT = {
+    route: (p, fn) => route(p, fn),
+    reroute: () => router(),
+    shell, loading, el, esc, fmtDate, fmtMoney, modal, confirmNote, toast,
+    statusTag, emptyInline,
+  };
+
   /* ---------------- 网络横幅 ---------------- */
 
   function renderBanner(online) {
@@ -202,6 +210,7 @@
 
   const NAV = [
     { path: '/dashboard', icon: '🎯', label: '报关作战台' },
+    { path: '/inspections', icon: '🗓️', label: '查验排期' },
     { path: '/declarations', icon: '📄', label: '报关单' },
     { path: '/clients', icon: '🤝', label: '客户与委托' },
     { path: '/audit', icon: '🛡️', label: '全名查看留痕' },
@@ -725,6 +734,7 @@
             <h3>🔄 状态流转（合规操作）</h3>
             <div id="actions" style="display:flex;gap:8px;flex-wrap:wrap"></div>
             <div id="assign-slot" style="margin-top:10px"></div>
+            <div id="inspection-slot"></div>
             ${queued.length ? `
               <div class="offline-panel" style="margin-top:12px">
                 <div class="op-title">⏳ 本地待合并动作（${queued.length}）</div>
@@ -753,7 +763,8 @@
     view.querySelector('#back-list').onclick = () => location.hash = '#/declarations';
     const actionsEl = view.querySelector('#actions');
     // 离线时仍允许基于快照动作排队（提交时不触网，恢复后合并）；文案会标明离线排队
-    const allowed = data.allowed_actions || [];
+    // 「布控查验(inspect)」不再允许裸点：必须先逻辑审核通过、再经查验卡排期（见 inspections.js）
+    const allowed = (data.allowed_actions || []).filter(a => a.action !== 'inspect');
     if (!allowed.length) {
       actionsEl.innerHTML = `<span class="muted small">当前状态/角色下无可执行流转（或已为终态）。</span>`;
     } else {
@@ -788,6 +799,11 @@
 
     const rv = view.querySelector('#reveal-name');
     if (rv) rv.onclick = () => openReveal(d.enterprise_id, d.enterprise_name, data);
+
+    // 扩展模块挂载查验卡（逻辑审核 / 排期 / 改派 / 空态）
+    if (window.BGTInspection && window.BGTInspection.mountDetailCard) {
+      window.BGTInspection.mountDetailCard(view, data, { refresh: router });
+    }
   }
 
   function taxDueFlag(d) {
@@ -1155,5 +1171,6 @@
 
   window.addEventListener('hashchange', router);
   if (!Api.loggedIn) location.hash = '#/login';
-  router();
+  // 延后一拍，确保在 app.js 之后同步加载的扩展模块（inspections.js）已注册路由
+  setTimeout(router, 0);
 })();

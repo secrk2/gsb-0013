@@ -2,6 +2,13 @@
 
 状态机规则集中在本文件，API 层只做取数 + 调 `guard_transition`，
 保证「非法回退拦下来说原因」只有一处事实来源。
+
+查验排期相关：
+- Yard（监管场站）→ Bay（查验车位/查验台，带资质标签）
+- User(role=inspector) 查验员，带资质标签与可派工状态（请假停用）
+- Inspection 排期单：含车位、查验员、计划起止、应查验日(due_at)、实际完成日、版本号
+- ReviewDecision 海关审单员逻辑审核结论（通过后才能排查验）
+- ScheduleLog 排期留痕：创建/拖拽改期/改派/取消/超窗口原因全部可追溯
 """
 from __future__ import annotations
 
@@ -20,10 +27,11 @@ from .database import Base
 # ---------- 枚举 ----------
 
 class Role(str, enum.Enum):
-    BROKER = "broker"          # 本行报关员
-    CUSTOMS = "customs"        # 海关审单员
-    ENTERPRISE = "enterprise"  # 进出口企业管理员
-    SUPERVISOR = "supervisor"  # 监管员
+    BROKER = "broker"            # 本行报关员
+    CUSTOMS = "customs"          # 海关审单员
+    ENTERPRISE = "enterprise"    # 进出口企业管理员
+    SUPERVISOR = "supervisor"    # 监管员
+    INSPECTOR = "inspector"      # 监管场站查验员
 
 
 ROLE_LABELS = {
@@ -31,6 +39,7 @@ ROLE_LABELS = {
     Role.CUSTOMS: "海关审单员",
     Role.ENTERPRISE: "企业管理员",
     Role.SUPERVISOR: "监管员",
+    Role.INSPECTOR: "查验员",
 }
 
 
@@ -69,7 +78,7 @@ STATUS_LABELS = {
 # 报关单合法流转：键为当前态，值为可流转的目标态 + 业务语义
 ALLOWED_TRANSITIONS: dict[DeclStatus, dict[DeclStatus, str]] = {
     DeclStatus.ENTRUSTED: {
-        DeclStatus.ENTERED: "报关员完成报关单录入",
+        DeclStatus.ENTERED: "报关员完成报关单要素录入",
         DeclStatus.CANCELLED: "委托取消",
     },
     DeclStatus.ENTERED: {
@@ -115,10 +124,13 @@ TRANSITION_ROLES: dict[tuple[DeclStatus, DeclStatus], set[Role]] = {
 class BizError(Exception):
     """业务规则被拦下时抛出，message 即给用户看的「原因」。"""
 
-    def __init__(self, reason: str, code: str = "biz_rule_violation", status_code: int = 409):
+    def __init__(self, reason: str, code: str = "biz_rule_violation", status_code: int = 409,
+                 details: list | None = None):
         self.reason = reason
         self.code = code
         self.status_code = status_code
+        # 结构化明细（如排期冲突逐条原因），前端可逐条标红、点开看原因
+        self.details = details or []
         super().__init__(reason)
 
 
@@ -187,7 +199,16 @@ class User(Base):
     active: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
+    # —— 查验员专用 ——
+    # 所属监管场站（查验员）；逗号分隔资质标签，如 cold,food,heavy,danger,normal
+    yard_id: Mapped[int | None] = mapped_column(ForeignKey("yards.id"), nullable=True)
+    inspector_certs: Mapped[str] = mapped_column(String(200), default="")
+    # 派工可用状态：车故障/人请假时置 false 并写 unavailable_reason；改派链据此过滤
+    available: Mapped[bool] = mapped_column(Boolean, default=True)
+    unavailable_reason: Mapped[str] = mapped_column(String(200), default="")
+
     enterprise: Mapped[Enterprise | None] = relationship(back_populates="users")
+    yard: Mapped["Yard | None"] = relationship(back_populates="inspectors")
 
 
 class Session(Base):
@@ -255,6 +276,8 @@ class Declaration(Base):
         back_populates="declaration", cascade="all, delete-orphan", order_by="DeclarationEvent.id")
     inspections: Mapped[list["Inspection"]] = relationship(
         back_populates="declaration", cascade="all, delete-orphan", order_by="Inspection.scheduled_at")
+    review_decisions: Mapped[list["ReviewDecision"]] = relationship(
+        back_populates="declaration", cascade="all, delete-orphan", order_by="ReviewDecision.id.desc()")
 
 
 class DeclarationEvent(Base):
@@ -275,21 +298,124 @@ class DeclarationEvent(Base):
     declaration: Mapped[Declaration] = relationship(back_populates="events")
 
 
+class Yard(Base):
+    """监管场站：查验排期的场地边界，链式改派只在同一场站内顺延。"""
+    __tablename__ = "yards"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    code: Mapped[str] = mapped_column(String(32), unique=True)
+    name: Mapped[str] = mapped_column(String(100))
+    port: Mapped[str] = mapped_column(String(64), default="")
+    address: Mapped[str] = mapped_column(String(200), default="")
+    # 每日可排时段（小时，24h 制），拖拽落点超窗口需二次确认填原因
+    open_hour: Mapped[int] = mapped_column(Integer, default=8)
+    close_hour: Mapped[int] = mapped_column(Integer, default=20)
+    # 允许向前排期的天数窗口（超过需二次确认）
+    horizon_days: Mapped[int] = mapped_column(Integer, default=7)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+    bays: Mapped[list["Bay"]] = relationship(
+        back_populates="yard", cascade="all, delete-orphan", order_by="Bay.seq")
+    inspectors: Mapped[list["User"]] = relationship(back_populates="yard")
+
+
+class Bay(Base):
+    """查验车位 / 查验台：同一车位同一时段不能占两单。
+
+    cert_tags：逗号分隔资质标签（normal/cold/food/heavy/danger…），
+    货物要求的资质必须是车位资质的子集，否则判「车位资质不匹配」。
+    out_of_service=True 表示车位故障停用（车故障改派来源之一）。
+    """
+    __tablename__ = "bays"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    yard_id: Mapped[int] = mapped_column(ForeignKey("yards.id"), index=True)
+    code: Mapped[str] = mapped_column(String(32))
+    name: Mapped[str] = mapped_column(String(100), default="")
+    cert_tags: Mapped[str] = mapped_column(String(200), default="normal")
+    seq: Mapped[int] = mapped_column(Integer, default=0)
+    out_of_service: Mapped[bool] = mapped_column(Boolean, default=False)
+    out_of_service_reason: Mapped[str] = mapped_column(String(200), default="")
+
+    yard: Mapped[Yard] = relationship(back_populates="bays")
+
+    __table_args__ = (UniqueConstraint("yard_id", "code", name="uq_bay_yard_code"),)
+
+
+class ReviewDecision(Base):
+    """海关审单员逻辑审核结论。审单通过（布控查验）是排查验计划的前置条件。"""
+    __tablename__ = "review_decisions"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    declaration_id: Mapped[int] = mapped_column(ForeignKey("declarations.id"), index=True)
+    officer_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
+    officer_name: Mapped[str] = mapped_column(String(64), default="")
+    result: Mapped[str] = mapped_column(String(16), default="pass_inspect")  # pass_inspect/release/return
+    document_ok: Mapped[bool] = mapped_column(Boolean, default=True)  # 单证一致性
+    logic_ok: Mapped[bool] = mapped_column(Boolean, default=True)     # 归类/价格逻辑
+    risk_tags: Mapped[str] = mapped_column(String(200), default="")   # 命中的风控点（逗号分隔）
+    opinion: Mapped[str] = mapped_column(String(400), default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+    declaration: Mapped[Declaration] = relationship(back_populates="review_decisions")
+
+
 class Inspection(Base):
-    """查验排期。"""
+    """查验排期单。
+
+    时段：[scheduled_at, scheduled_end)；应查验日 due_at（审核布控后约定的到场期限）。
+    同车位/同查验员在该时段内与其他未取消单重叠即冲突。
+    改派时 version+1（乐观锁，避免两个人同时拖拽互相覆盖）。
+    """
     __tablename__ = "inspections"
 
     id: Mapped[int] = mapped_column(primary_key=True)
     declaration_id: Mapped[int] = mapped_column(ForeignKey("declarations.id"), index=True)
-    scheduled_at: Mapped[datetime] = mapped_column(DateTime)
+    yard_id: Mapped[int | None] = mapped_column(ForeignKey("yards.id"), nullable=True, index=True)
+    bay_id: Mapped[int | None] = mapped_column(ForeignKey("bays.id"), nullable=True)
+    scheduled_at: Mapped[datetime] = mapped_column(DateTime, index=True)
+    scheduled_end: Mapped[datetime] = mapped_column(DateTime)
+    due_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)  # 应查验日（及时率分母锚点）
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)  # 实际查验完成日
     port: Mapped[str] = mapped_column(String(64))
-    bay: Mapped[str] = mapped_column(String(64), default="")
+    bay: Mapped[str] = mapped_column(String(64), default="")  # 兼容旧字段：车位名冗余
     inspector_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True)
-    status: Mapped[str] = mapped_column(String(16), default="pending")  # pending/inspecting/done/abnormal
+    # scheduled 已排期待查验 / inspecting 查验中 / done 已完成 / abnormal 异常 / cancelled 已取消
+    status: Mapped[str] = mapped_column(String(16), default="scheduled", index=True)
     result_note: Mapped[str] = mapped_column(String(300), default="")
+    # 货物要求的资质标签（建排期时按 HS/货物推断，冗余到排期单上）
+    required_certs: Mapped[str] = mapped_column(String(200), default="normal")
+    version: Mapped[int] = mapped_column(Integer, default=1)
+    # 被哪一次改派链调整过（同一条链共享 reassign_batch_id，便于留痕追溯）
+    reassign_batch_id: Mapped[str | None] = mapped_column(String(40), nullable=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    declaration: Mapped[Declaration] = relationship(back_populates="inspections", foreign_keys=[declaration_id])
+    yard: Mapped[Yard | None] = relationship()
+    bay_ref: Mapped[Bay | None] = relationship()
+    inspector: Mapped[User | None] = relationship(foreign_keys=[inspector_id])
+    logs: Mapped[list["ScheduleLog"]] = relationship(
+        back_populates="inspection", cascade="all, delete-orphan", order_by="ScheduleLog.id")
+
+
+class ScheduleLog(Base):
+    """排期留痕：创建、拖拽改期（含超窗口原因）、改派、链式顺延、取消全部逐条记录。"""
+    __tablename__ = "schedule_logs"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    inspection_id: Mapped[int] = mapped_column(ForeignKey("inspections.id"), index=True)
+    declaration_id: Mapped[int] = mapped_column(ForeignKey("declarations.id"), index=True)
+    actor_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    actor_name: Mapped[str] = mapped_column(String(64), default="")
+    # create / move / reassign / chain_move / cancel / finish / window_override
+    action: Mapped[str] = mapped_column(String(20), index=True)
+    reassign_batch_id: Mapped[str | None] = mapped_column(String(40), nullable=True, index=True)
+    reason: Mapped[str] = mapped_column(String(400), default="")
+    detail: Mapped[str] = mapped_column(Text, default="")  # JSON 文本：旧值→新值、冲突明细等
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
-    declaration: Mapped[Declaration] = relationship(back_populates="inspections")
+    inspection: Mapped[Inspection] = relationship(back_populates="logs")
 
 
 class NameReveal(Base):

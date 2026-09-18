@@ -199,6 +199,161 @@ cid = r["contract"]["id"]
 st, r = call("POST", f"/contracts/{cid}/sign", broker, {})
 check("合同签署生效", st == 200 and r["contract"]["status"] == "active")
 
+# ============================================================
+# 13. 审单与查验：逻辑审核 → 排期冲突 → 窗口确认 → 改派链 → 取消/锁定/及时率
+# ============================================================
+_, inspector_login = call("POST", "/auth/login", body={"username": "sun_li", "password": "bgt123456"})
+insp_tok = inspector_login.get("token")
+check("查验员账号可登录", bool(insp_tok) and inspector_login["user"]["role"] == "inspector",
+      inspector_login.get("user"))
+
+# 13.1 未逻辑审核不能排期（d3 审单中，尚无 pass_inspect）
+st, r = call("POST", "/inspections", customs, {
+    "declaration_id": 3, "yard_id": 1, "bay_id": 1, "inspector_id": 8,
+    "scheduled_at": "2026-09-19T09:00", "duration_minutes": 120})
+check("未逻辑审核直接排期被拦", st == 409 and r["error"]["code"] == "review_required", r.get("error"))
+
+# 裸点状态机布控同样被拦（d8 无审核结论）
+st, r = call("POST", "/declarations/8/transition", customs, {"action": "inspect", "note": "跳过审核"})
+check("无审核结论裸点布控被拦", st == 409 and r["error"]["code"] == "review_required")
+
+# 13.2 逻辑审核通过
+st, r = call("POST", "/review-decisions", customs, {
+    "declaration_id": 3, "result": "pass_inspect", "document_ok": True, "logic_ok": True,
+    "opinion": "单证逻辑通过，命中布控"})
+check("逻辑审核通过(pass_inspect)", st == 200 and r["result"] == "pass_inspect")
+# 通过后正常排期（d3 明天 A-01/孙丽），自动转查验中
+st, r = call("POST", "/inspections", customs, {
+    "declaration_id": 3, "yard_id": 1, "bay_id": 1, "inspector_id": 8,
+    "scheduled_at": "2026-09-19T09:00", "duration_minutes": 120, "due_at": "2026-09-19T12:00"})
+check("审核通过后排期成功并转查验中(d3)",
+      st == 200 and r["inspection"]["decl_status"] == "inspecting", r.get("error"))
+# 通过但勾否的矛盾结论被拦（d8 还未审核）
+st, r = call("POST", "/review-decisions", customs, {
+    "declaration_id": 8, "result": "pass_inspect", "document_ok": False, "logic_ok": True})
+check("审核通过但单证不一致被拦(400)", st == 400 and r["error"]["code"] == "review_contradiction")
+
+# 13.3 资质不匹配冲突（三文鱼冷链货 d9 → 普通车位 A-01 + 无冷链查验员周强 id=9）
+st, r = call("POST", "/inspections/conflicts", customs, {
+    "declaration_id": 9, "yard_id": 1, "bay_id": 1, "inspector_id": 9,
+    "scheduled_at": "2026-09-19T09:00", "duration_minutes": 120})
+codes = {c["code"] for c in r["hard_conflicts"]}
+check("资质不匹配冲突（车位+查验员）", st == 200 and {"bay_cert_mismatch", "inspector_cert_mismatch"} <= codes,
+      codes)
+check("冲突明细含可读原因", all(c.get("reason") for c in r["hard_conflicts"]))
+
+# 13.4 同车位同时段两单占（蛇口 B-12 id=5 今日10:00 已排 i20；郑敏 id=11）
+st, r = call("POST", "/inspections/conflicts", customs, {
+    "declaration_id": 8, "yard_id": 2, "bay_id": 5, "inspector_id": 11,
+    "scheduled_at": "2026-09-18T10:00", "duration_minutes": 120})
+codes = {c["code"] for c in r["hard_conflicts"]}
+check("同车位同段两单占冲突", "bay_overlap" in codes, codes)
+check("冲突带关联单可点开", any(c.get("related", {}).get("decl_no") for c in r["hard_conflicts"]
+      if c["code"] == "bay_overlap"))
+
+# 请假查验员（林凯 id=10 seeded unavailable）→ 硬冲突
+st, r = call("POST", "/inspections/conflicts", customs, {
+    "declaration_id": 8, "yard_id": 2, "bay_id": 6, "inspector_id": 10,
+    "scheduled_at": "2026-09-19T09:00", "duration_minutes": 120})
+codes = {c["code"] for c in r["hard_conflicts"]}
+check("请假查验员被拦(inspector_unavailable)", "inspector_unavailable" in codes, codes)
+
+# 13.5 d8 审核后排期成功（蛇口 B-12/郑敏 明天，不与今日 i20 冲突）
+call("POST", "/review-decisions", customs, {
+    "declaration_id": 8, "result": "pass_inspect", "document_ok": True, "logic_ok": True,
+    "opinion": "机检查验"})
+st, r = call("POST", "/inspections", customs, {
+    "declaration_id": 8, "yard_id": 2, "bay_id": 5, "inspector_id": 11,
+    "scheduled_at": "2026-09-19T09:00", "duration_minutes": 120, "due_at": "2026-09-19T12:00"})
+check("d8 审核通过后排期成功",
+      st == 200 and r["inspection"]["decl_status"] == "inspecting", r.get("error"))
+
+# 13.6 超作业窗口：无确认被拦，有确认+原因留痕后通过
+st, r = call("POST", "/inspections/4/move", customs, {
+    "scheduled_at": "2026-09-18T22:00", "expected_version": 1})
+check("超窗口无确认被拦(409)", st == 409 and r["error"]["code"] == "window_confirmation_required",
+      r.get("error", {}).get("code"))
+st, r = call("POST", "/inspections/4/move", customs, {
+    "scheduled_at": "2026-09-18T22:00", "window_confirmed": True,
+    "window_reason": "船舶夜航靠泊，场站确认增开夜班查验"})
+check("超窗口填原因确认后通过", st == 200 and r["inspection"]["scheduled_at"].endswith("22:00"))
+st, r = call("POST", "/inspections/4/move", customs, {
+    "scheduled_at": "2026-09-18T22:30", "window_confirmed": True, "window_reason": "短"})
+check("超窗口原因过短被拦(400)", st == 400 and r["error"]["code"] == "window_reason_required")
+
+# 13.7 改派链式重排（预览 → 确认；锚点 i6=id1 从10:30推11:30，i14/i16 必须链式顺延）
+st, prev = call("POST", "/inspections/1/reassign/preview", customs, {
+    "new_scheduled_at": "2026-09-18T11:30", "new_bay_id": 4, "new_inspector_id": 9,
+    "duration_minutes": 120, "reason_type": "manual", "reason": "预览用"})
+check("改派预览成功", st == 200 and len(prev["plan"]["moves"]) >= 3,
+      json.dumps(prev.get("plan", {}).get("moves", []), ensure_ascii=False))
+moved_nos = [m["decl_no"] for m in prev["plan"]["moves"]]
+check("链式顺延含后续同场站单", "I2026091700014" in moved_nos and "I2026091800016" in moved_nos, moved_nos)
+chain_times = {m["decl_no"]: m["to_scheduled_at"][11:] for m in prev["plan"]["moves"]}
+check("顺延只向后不回退", all(m["to_scheduled_at"] >= m["from_scheduled_at"]
+                               for m in prev["plan"]["moves"]))
+st, conf = call("POST", "/inspections/1/reassign/confirm", customs, {
+    "new_scheduled_at": "2026-09-18T11:30", "new_bay_id": 4, "new_inspector_id": 9,
+    "duration_minutes": 120, "reason_type": "manual",
+    "reason": "船公司压港统一后延一小时冒烟验证"})
+check("改派确认执行", st == 200 and conf.get("batch_id"))
+check("改派单与后续单共享批次留痕号",
+      len({m.get("to_scheduled_at") for m in conf["plan"]["moves"]}) >= 2)
+
+# 13.8 已放行/已结关单锁定：d1（已结关）的历史查验不可拖动/改派/取消
+_, d1_insps = call("GET", "/inspections?declaration_id=1", customs)
+d1_insp_id = d1_insps[0]["id"]
+st, r = call("POST", f"/inspections/{d1_insp_id}/move", customs,
+             {"scheduled_at": "2026-09-25T09:00"})
+check("已结关单查验锁定不可拖动", st == 409 and r["error"]["code"] == "inspection_locked")
+st, r = call("POST", f"/inspections/{d1_insp_id}/cancel", customs, {"reason": "试图取消结关单查验"})
+check("已结关单查验不可取消", st == 409 and r["error"]["code"] == "inspection_locked")
+
+# 13.9 取消排期（d3 的排期取消 → 该单只剩已取消排期，对应前端第3种空态）
+_, d3_insps = call("GET", "/inspections?declaration_id=3", customs)
+st, r = call("POST", f"/inspections/{d3_insps[0]['id']}/cancel", customs,
+             {"reason": "企业车队故障无法到场，取消待重排"})
+check("取消排期成功并留痕", st == 200 and r["inspection"]["status"] == "cancelled")
+_, d3_after = call("GET", "/inspections?declaration_id=3", customs)
+check("该单排期全部取消（第3种空态数据条件）",
+      all(x["status"] == "cancelled" for x in d3_after) and len(d3_after) >= 1)
+
+# 13.10 甘特接口带逐条冲突（种子红单：d17/d18 撞车位撞查验员，d9 资质不符）
+# 用周甘特确保昨天逾期的 d9 也落在拉取窗口内
+st, g = call("GET", "/scheduling/gantt?yard_id=1&view=week", customs)
+conflict_ids = {i["declaration_id"] for i in g["inspections"] if i["conflicts"]}
+check("甘特返回逐条冲突标红数据",
+      st == 200 and 17 in conflict_ids and 18 in conflict_ids and 9 in conflict_ids,
+      conflict_ids)
+red = next(i for i in g["inspections"] if i["declaration_id"] == 17)
+check("冲突条目含结构化原因与关联单",
+      any(c["code"] == "bay_overlap" and c.get("related", {}).get("decl_no")
+          for c in red["conflicts"]))
+
+# 13.11 及时率双口径（8 月频繁改派：两口径方向相反；公式随接口下发）
+st, m = call("GET", "/metrics/timeliness?month=2026-08", customs)
+check("及时率接口返回双口径", st == 200 and "time" in m["calibers"] and "volume" in m["calibers"])
+check("8月时效口径36.4%（4/11）", m["calibers"]["time"]["rate_percent"] == 36.4,
+      m["calibers"]["time"])
+check("8月单量口径91.7%（11/12）", m["calibers"]["volume"]["rate_percent"] == 91.7,
+      m["calibers"]["volume"])
+check("两口径8月方向相反（时效低、单量高）",
+      m["calibers"]["time"]["rate_percent"] < 50 < m["calibers"]["volume"]["rate_percent"])
+check("口径公式随接口返回（写界面用）",
+      "应查验日" in m["calibers"]["time"]["formula"] and "派" in m["calibers"]["volume"]["formula"])
+check("8月含改派留痕", m["calibers"]["reassign_logs"] >= 2)
+check("近6个月走势", len(m["months"]) == 6 and any(x["time_rate"] is not None for x in m["months"]))
+
+# 13.12 该单无排期（第2种空态）：找一张委托中/已录入单，其排期列表为空
+_, no_insp = call("GET", "/inspections?declaration_id=4", customs)
+check("该单无排期返回空列表（非错误）", isinstance(no_insp, list) and no_insp == [])
+
+# 13.13 查验员权限：普通查验员不能替他人单登记结果以外的排期管理动作
+st, r = call("POST", "/inspections", insp_tok, {
+    "declaration_id": 8, "yard_id": 2, "bay_id": 5, "inspector_id": 12,
+    "scheduled_at": "2026-09-20T09:00"})
+check("查验员无权创建排期(403)", st == 403)
+
 print("\n==============================")
 print(f"PASS {len(PASS)} / FAIL {len(FAIL)}")
 if FAIL:
