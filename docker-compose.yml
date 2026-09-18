@@ -1,0 +1,28 @@
+services:
+  backend:
+    build: ./backend
+    container_name: bgt-backend
+    ports:
+      - "7106:7106"
+    volumes:
+      - bgt-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:7106/api/health', timeout=5)"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 8s
+
+  frontend:
+    build: ./frontend
+    container_name: bgt-frontend
+    ports:
+      - "8106:8106"
+    depends_on:
+      backend:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  bgt-data:
