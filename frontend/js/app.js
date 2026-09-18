@@ -202,6 +202,7 @@
 
   const NAV = [
     { path: '/dashboard', icon: '🎯', label: '报关作战台' },
+    { path: '/scheduling', icon: '🗓️', label: '查验排期' },
     { path: '/declarations', icon: '📄', label: '报关单' },
     { path: '/clients', icon: '🤝', label: '客户与委托' },
     { path: '/audit', icon: '🛡️', label: '全名查看留痕' },
@@ -339,17 +340,17 @@
         <h3>📅 查验排期 ${rd.inspection_overdue ? `<span class="dot red">逾期 ${rd.inspection_overdue}</span>` : ''}</h3>
         <div class="table-wrap">
           <table class="data">
-            <thead><tr><th>计划时间</th><th>状态</th><th>报关单号</th><th>企业</th><th>货物</th><th>口岸 / 台位</th><th>结果备注</th></tr></thead>
+            <thead><tr><th>计划时间</th><th>状态</th><th>报关单号</th><th>企业</th><th>货物</th><th>场站 / 车位</th><th>结果备注</th></tr></thead>
             <tbody>
               ${d.inspection_schedule.map(i => `
                 <tr class="clickable" data-decl="${i.declaration_id}">
                   <td class="${i.overdue ? 'tax-line overdue' : ''}">${fmtDate(i.scheduled_at)} ${i.overdue ? '🔴已逾期' : ''}</td>
-                  <td><span class="dot ${i.status === 'done' ? 'green' : i.status === 'abnormal' ? 'red' : 'amber'}">${esc(i.status_label)}</span></td>
+                  <td><span class="dot ${i.status === 'done' ? 'green' : i.status === 'abnormal' ? 'red' : i.status === 'cancelled' ? 'gray' : 'amber'}">${esc(i.status_label)}</span></td>
                   <td class="mono">${esc(i.decl_no)}</td>
                   <td>${esc(i.enterprise_name)}</td>
                   <td>${esc(i.cargo_name)}</td>
-                  <td>${esc(i.port)} / ${esc(i.bay)}</td>
-                  <td class="muted small">${esc(i.result_note || '—')}</td>
+                  <td>${esc(i.yard_name || i.port || '')} / ${esc(i.bay_code || '')}</td>
+                  <td class="muted small">${esc(i.result_note || (i.status === 'cancelled' ? ('已取消：' + (i.cancel_reason || '')) : '—'))}</td>
                 </tr>`).join('') || '<tr><td colspan="7" class="muted" style="text-align:center;padding:24px">暂无查验任务</td></tr>'}
             </tbody>
           </table>
@@ -722,6 +723,10 @@
               ? '<button class="btn gold" id="pay-tax" style="margin-top:10px">登记缴税</button>' : ''}
           </div>
           <div class="card">
+            <h3>🛃 查验排期</h3>
+            <div id="detail-inspection"></div>
+          </div>
+          <div class="card">
             <h3>🔄 状态流转（合规操作）</h3>
             <div id="actions" style="display:flex;gap:8px;flex-wrap:wrap"></div>
             <div id="assign-slot" style="margin-top:10px"></div>
@@ -788,6 +793,9 @@
 
     const rv = view.querySelector('#reveal-name');
     if (rv) rv.onclick = () => openReveal(d.enterprise_id, d.enterprise_name, data);
+
+    // 查验排期卡（当前排期 / 该单无排期 / 排期全取消 三种独立状态）
+    if (window.SchedulingModule) window.SchedulingModule.bindDetail(view, data);
   }
 
   function taxDueFlag(d) {
@@ -1139,6 +1147,15 @@
   }
 
   /* ---------------- 启动 ---------------- */
+
+  // 向查验排期模块注入应用上下文（路由注册、外壳、复用 UI 件）
+  if (window.SchedulingModule) {
+    window.SchedulingModule.register({
+      route, shell, Api,
+      el, esc, modal, toast, fmtDate, fmtMoney, confirmNote, loading,
+      rerun: () => window.dispatchEvent(new Event('hashchange')),
+    });
+  }
 
   Offline.init();
   Offline.onChange((online) => {

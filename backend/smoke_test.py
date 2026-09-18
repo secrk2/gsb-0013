@@ -199,6 +199,55 @@ cid = r["contract"]["id"]
 st, r = call("POST", f"/contracts/{cid}/sign", broker, {})
 check("合同签署生效", st == 200 and r["contract"]["status"] == "active")
 
+# 13. 查验排期：资源目录、周日甘特冲突、三态、双口径及时率
+from datetime import datetime as _dt2, timedelta as _td
+st, res = call("GET", "/scheduling/resources", customs)
+check("资源目录：3 监管场站", st == 200 and len(res["yards"]) == 3)
+check("含带资质查验员（含请假中）",
+      any(u.get("on_leave") for u in res["inspectors"]) and len(res["inspectors"]) >= 4)
+check("含故障停用车位", any(b["out_of_service"] for y in res["yards"] for b in y["bays"]))
+
+yt = next(y for y in res["yards"] if "盐田" in y["name"])
+ns = next(y for y in res["yards"] if "南沙" in y["name"])
+_now = _dt2.utcnow()
+_mon = _now - _td(days=_now.weekday())
+_iso = lambda d: d.strftime("%Y-%m-%dT%H:%M")
+st, cal = call("GET", f"/scheduling/calendar?yard_id={yt['id']}&start={_iso(_mon)}&end={_iso(_mon + _td(days=7))}", customs)
+check("周甘特含标红冲突条", st == 200 and any(i["has_conflict"] for i in cal["inspections"]))
+red = [c for i in cal["inspections"] if i["has_conflict"] for c in i["current_conflicts"]]
+check("冲突为结构化逐条（含原因与对方）", all(c.get("reason") and c.get("code") for c in red) and len(red) >= 1)
+check("能检出车位故障/查验员请假冲突",
+      {"bay_broken", "inspector_leave"} & {c["code"] for c in red} != set())
+
+st, nscal = call("GET", f"/scheduling/calendar?yard_id={ns['id']}&start={_iso(_mon)}&end={_iso(_mon + _td(days=7))}", customs)
+check("南沙场站=排期全取消空态", nscal["all_cancelled"] and len(nscal["inspections"]) == 0
+      and nscal["cancelled_count"] >= 1)
+_fut = _mon + _td(days=40)
+st, ecal = call("GET", f"/scheduling/calendar?yard_id={yt['id']}&start={_iso(_fut)}&end={_iso(_fut + _td(days=7))}", customs)
+check("无任务时段=空排期空态（区别于全取消）", not ecal["all_cancelled"] and len(ecal["inspections"]) == 0)
+
+# 双占必被逐条拦（409 不改数据）：把一条待查拖到另一条同时同车位同查验员
+pend = [i for i in cal["inspections"] if i["status"] in ("pending", "inspecting")]
+if len(pend) >= 2:
+    a, b = pend[0], pend[1]
+    st, r = call("POST", f"/scheduling/inspections/{a['id']}/reschedule", customs, {
+        "scheduled_at": b["scheduled_at"], "bay_id": b["bay_id"], "inspector_id": b["inspector_id"]})
+    codes = {c["code"] for c in r.get("error", {}).get("conflicts", [])}
+    check("同车位+同查验员双占逐条拦截(409)", st == 409
+          and {"bay_double_book", "inspector_double_book"} & codes != set(), codes)
+
+# 及时率双口径：8 月频繁改派，两口径背离，且接口返回口径文字定义
+st, tm = call("GET", "/scheduling/timeliness", customs)
+aug = next(x for x in tm["series"] if x["month"] == "2026-08")
+check("及时率双口径并列返回", aug["day_rate"] is not None and aug["completion_rate"] is not None)
+check("8月两口径背离（完成率高/准点率低）", aug["completion_rate"] - aug["day_rate"] >= 30, aug)
+check("口径定义写入接口（前端直接展示）",
+      tm["definitions"]["day_rate"].get("formula") and tm["definitions"].get("divergence_note"))
+
+# 改派/取消须角色：报关员 403
+st, _ = call("POST", f"/scheduling/inspections/{pend[0]['id']}/cancel", broker, {"reason": "越权尝试取消排期"})
+check("报关员无权改查验排期(403)", st == 403)
+
 print("\n==============================")
 print(f"PASS {len(PASS)} / FAIL {len(FAIL)}")
 if FAIL:

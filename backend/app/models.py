@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 import enum
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from sqlalchemy import (
     Boolean, DateTime, Enum, ForeignKey, Integer, Numeric, String, Text,
@@ -22,6 +22,7 @@ from .database import Base
 class Role(str, enum.Enum):
     BROKER = "broker"          # 本行报关员
     CUSTOMS = "customs"        # 海关审单员
+    INSPECTOR = "inspector"    # 监管场站查验员
     ENTERPRISE = "enterprise"  # 进出口企业管理员
     SUPERVISOR = "supervisor"  # 监管员
 
@@ -29,6 +30,7 @@ class Role(str, enum.Enum):
 ROLE_LABELS = {
     Role.BROKER: "报关员",
     Role.CUSTOMS: "海关审单员",
+    Role.INSPECTOR: "查验员",
     Role.ENTERPRISE: "企业管理员",
     Role.SUPERVISOR: "监管员",
 }
@@ -96,6 +98,40 @@ ALLOWED_TRANSITIONS: dict[DeclStatus, dict[DeclStatus, str]] = {
 # 终态：终态再做任何流转都拦下
 TERMINAL_STATUSES = {DeclStatus.CLOSED, DeclStatus.CANCELLED}
 
+# ---------- 查验资质 ----------
+# 按 HS 编码章节（前 2 位）推导货物所需查验资质；None 表示普通货物，任意查验员/普货台位均可
+QUAL_CHILLED = "chilled"   # 冷链（动植食，需冷链查验资质 + 冷链台位）
+QUAL_DG = "dg"             # 危险品（危化品查验资质 + 危化台位）
+QUAL_LARGE = "large"       # 大型设备（大型设备台位）
+
+QUAL_LABELS = {
+    QUAL_CHILLED: "冷链查验",
+    QUAL_DG: "危险品查验",
+    QUAL_LARGE: "大型设备查验",
+}
+
+# HS 章节 → 所需资质（与种子数据中的货物品类对应）
+HS_CHAPTER_QUAL: dict[str, str] = {
+    "02": QUAL_CHILLED, "03": QUAL_CHILLED, "16": QUAL_CHILLED,
+    "28": QUAL_DG, "29": QUAL_DG,
+}
+
+
+def qual_for_cargo(hs_code: str, cargo_name: str = "") -> str | None:
+    """按 HS 章节推导货物所需查验资质；名称含冷链/危化关键词的兜底识别。"""
+    hs = (hs_code or "").strip()
+    if len(hs) >= 2 and hs[:2] in HS_CHAPTER_QUAL:
+        return HS_CHAPTER_QUAL[hs[:2]]
+    name = cargo_name or ""
+    if any(k in name for k in ("冻", "冷", "生鲜", "冷藏")):
+        return QUAL_CHILLED
+    if any(k in name for k in ("危化", "易燃", "易爆", "腐蚀")):
+        return QUAL_DG
+    if any(k in name for k in ("数控机床", "大型", "重型", "整机")):
+        return QUAL_LARGE
+    return None
+
+
 # 各角色在一次流转中的权限（职责分离，越权操作同样拦下并说明原因）
 TRANSITION_ROLES: dict[tuple[DeclStatus, DeclStatus], set[Role]] = {
     (DeclStatus.ENTRUSTED, DeclStatus.ENTERED): {Role.BROKER},
@@ -115,10 +151,12 @@ TRANSITION_ROLES: dict[tuple[DeclStatus, DeclStatus], set[Role]] = {
 class BizError(Exception):
     """业务规则被拦下时抛出，message 即给用户看的「原因」。"""
 
-    def __init__(self, reason: str, code: str = "biz_rule_violation", status_code: int = 409):
+    def __init__(self, reason: str, code: str = "biz_rule_violation", status_code: int = 409,
+                 extra: dict | None = None):
         self.reason = reason
         self.code = code
         self.status_code = status_code
+        self.extra = extra or {}  # 结构化附加信息（如逐条冲突清单），随错误体返回
         super().__init__(reason)
 
 
@@ -184,10 +222,18 @@ class User(Base):
     role: Mapped[Role] = mapped_column(Enum(Role))
     enterprise_id: Mapped[int | None] = mapped_column(ForeignKey("enterprises.id"), nullable=True)
     port: Mapped[str] = mapped_column(String(64), default="")  # 报关员常驻口岸
+    # 查验员：逗号分隔的资质码（chilled/dg/large）；空表示仅具普货查验资质
+    qualifications: Mapped[str] = mapped_column(String(120), default="")
+    # 查验员请假中：排期引擎视为不可派（与故障车位对称），原排期须走改派
+    on_leave: Mapped[bool] = mapped_column(Boolean, default=False)
     active: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
     enterprise: Mapped[Enterprise | None] = relationship(back_populates="users")
+
+    @property
+    def qual_list(self) -> list[str]:
+        return [q.strip() for q in (self.qualifications or "").split(",") if q.strip()]
 
 
 class Session(Base):
@@ -275,21 +321,117 @@ class DeclarationEvent(Base):
     declaration: Mapped[Declaration] = relationship(back_populates="events")
 
 
+class Yard(Base):
+    """监管场站：查验在监管场站排期，按场站维度组织车位与查验员。"""
+    __tablename__ = "yards"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(80), unique=True)
+    port: Mapped[str] = mapped_column(String(64), index=True)
+    # 营业窗口（本地时间，小时浮点），拖到窗口外落位须二次确认并填原因留痕
+    open_hour: Mapped[float] = mapped_column(Numeric(4, 2), default=8.5)
+    close_hour: Mapped[float] = mapped_column(Numeric(4, 2), default=17.5)
+    work_weekend: Mapped[bool] = mapped_column(Boolean, default=False)  # 周末是否作业
+    active: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+    bays: Mapped[list["Bay"]] = relationship(
+        back_populates="yard", cascade="all, delete-orphan", order_by="Bay.sort_no, Bay.id")
+
+
+class Bay(Base):
+    """查验车位（台位）。kind 决定能查哪类货，out_of_service 表示故障停用。"""
+    __tablename__ = "bays"
+    __table_args__ = (
+        UniqueConstraint("yard_id", "code", name="uq_bay_yard_code"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    yard_id: Mapped[int] = mapped_column(ForeignKey("yards.id"), index=True)
+    code: Mapped[str] = mapped_column(String(40))           # 如 A-12
+    name: Mapped[str] = mapped_column(String(80), default="")
+    kind: Mapped[str] = mapped_column(String(16), default="general")  # general/chilled/dg/large
+    sort_no: Mapped[int] = mapped_column(Integer, default=0)
+    out_of_service: Mapped[bool] = mapped_column(Boolean, default=False)  # 车位故障
+    note: Mapped[str] = mapped_column(String(200), default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+    yard: Mapped[Yard] = relationship(back_populates="bays")
+
+
+BAY_KIND_LABELS = {
+    "general": "普货台位",
+    "chilled": "冷链查验平台",
+    "dg": "危化查验专区",
+    "large": "大型设备台位",
+}
+
+# 货物资质 → 唯一匹配的台位类型
+QUAL_TO_BAY_KIND = {
+    QUAL_CHILLED: "chilled",
+    QUAL_DG: "dg",
+    QUAL_LARGE: "large",
+}
+
+
 class Inspection(Base):
-    """查验排期。"""
+    """查验排期：一条排期 = 某单在某场站某车位、由某查验员在某时段实施查验。"""
     __tablename__ = "inspections"
 
     id: Mapped[int] = mapped_column(primary_key=True)
     declaration_id: Mapped[int] = mapped_column(ForeignKey("declarations.id"), index=True)
-    scheduled_at: Mapped[datetime] = mapped_column(DateTime)
-    port: Mapped[str] = mapped_column(String(64))
-    bay: Mapped[str] = mapped_column(String(64), default="")
-    inspector_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True)
-    status: Mapped[str] = mapped_column(String(16), default="pending")  # pending/inspecting/done/abnormal
+    yard_id: Mapped[int | None] = mapped_column(ForeignKey("yards.id"), nullable=True, index=True)
+    bay_id: Mapped[int | None] = mapped_column(ForeignKey("bays.id"), nullable=True, index=True)
+    inspector_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True, index=True)
+
+    scheduled_at: Mapped[datetime] = mapped_column(DateTime, index=True)      # 计划开始
+    scheduled_end: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)  # 计划结束（重叠判定用）
+    duration_minutes: Mapped[int] = mapped_column(Integer, default=120)       # 单查标准耗时
+    required_qual: Mapped[str | None] = mapped_column(String(16), nullable=True)  # 排期时按 HS 快照，防止改归类后口径漂移
+
+    # 应查验日：布控排期时确定（通常=计划查验日），及时率「日口径」分母基准
+    due_date: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+    # pending 待查验 / inspecting 查验中 / done 已完成 / abnormal 异常 / cancelled 已取消
+    status: Mapped[str] = mapped_column(String(16), default="pending", index=True)
+    cancel_reason: Mapped[str] = mapped_column(String(300), default="")
     result_note: Mapped[str] = mapped_column(String(300), default="")
+
+    # 链式重排批次号：同一次改派触发的后移共用一批，便于留痕与回滚展示
+    chain_batch: Mapped[str | None] = mapped_column(String(40), nullable=True, index=True)
+    reassign_count: Mapped[int] = mapped_column(Integer, default=0)  # 被改派/顺延次数
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
     declaration: Mapped[Declaration] = relationship(back_populates="inspections")
+    yard: Mapped[Yard | None] = relationship()
+    bay: Mapped[Bay | None] = relationship()
+    inspector: Mapped[User | None] = relationship(foreign_keys=[inspector_id])
+
+    @property
+    def end_time(self) -> datetime:
+        return self.scheduled_end or (self.scheduled_at + timedelta(minutes=self.duration_minutes or 120))
+
+
+class ScheduleChange(Base):
+    """排期变更留痕：安排/拖拽改期/超窗口/改派/链式顺延/取消/故障请假 全部逐条留痕。"""
+    __tablename__ = "schedule_changes"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    inspection_id: Mapped[int | None] = mapped_column(ForeignKey("inspections.id"), nullable=True, index=True)
+    declaration_id: Mapped[int | None] = mapped_column(ForeignKey("declarations.id"), nullable=True, index=True)
+    yard_id: Mapped[int | None] = mapped_column(ForeignKey("yards.id"), nullable=True)
+    actor_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    actor_name: Mapped[str] = mapped_column(String(64), default="")
+
+    change_type: Mapped[str] = mapped_column(String(24), index=True)
+    # schedule 安排 / drag 拖拽改期 / out_of_window 超窗口落位 / reassign 改派
+    # chain_shift 链式顺延 / cancel 取消 / bay_broken 车位故障 / inspector_leave 查验员请假
+    reason: Mapped[str] = mapped_column(String(400), default="")
+    detail: Mapped[str] = mapped_column(Text, default="")  # JSON：前后时间/车位/查验员、批次、连锁条目
+    chain_batch: Mapped[str | None] = mapped_column(String(40), nullable=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
 class NameReveal(Base):

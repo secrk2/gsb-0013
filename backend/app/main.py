@@ -11,7 +11,7 @@ from fastapi.staticfiles import StaticFiles
 from .config import settings
 from .database import Base, engine
 from .models import BizError
-from .routers import auth, clients, declarations, dashboard
+from .routers import auth, clients, declarations, dashboard, scheduling
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("baoguantong")
@@ -30,11 +30,14 @@ app.add_middleware(
 
 @app.exception_handler(BizError)
 async def biz_error_handler(request: Request, exc: BizError):
-    """所有业务拦截统一结构：{error: {code, reason}}，前端直接把 reason 展示给用户。"""
-    return JSONResponse(
-        status_code=exc.status_code,
-        content={"error": {"code": exc.code, "reason": exc.reason}},
-    )
+    """所有业务拦截统一结构：{error: {code, reason, ...}}，前端直接把 reason 展示给用户。
+
+    排期冲突等场景带结构化 conflicts[]，前端逐条标红、点开看原因，而非一句笼统报错。
+    """
+    payload = {"code": exc.code, "reason": exc.reason}
+    if exc.extra:
+        payload.update(exc.extra)
+    return JSONResponse(status_code=exc.status_code, content={"error": payload})
 
 
 @app.exception_handler(Exception)
@@ -50,6 +53,7 @@ app.include_router(auth.router, prefix="/api")
 app.include_router(clients.router, prefix="/api")
 app.include_router(declarations.router, prefix="/api")
 app.include_router(dashboard.router, prefix="/api")
+app.include_router(scheduling.router, prefix="/api")
 
 
 @app.get("/api/health")

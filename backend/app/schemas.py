@@ -8,7 +8,7 @@ from pydantic import BaseModel, Field
 
 from .models import (
     Role, DeclStatus, EnterpriseStatus, ContractStatus,
-    ROLE_LABELS, STATUS_LABELS,
+    ROLE_LABELS, STATUS_LABELS, QUAL_LABELS,
 )
 
 
@@ -71,11 +71,43 @@ class RevealNameIn(BaseModel):
     reason: str = Field(max_length=300, description="二次确认必须填写查看理由，至少10字")
 
 
-class InspectionCreateIn(BaseModel):
+class InspectionScheduleIn(BaseModel):
+    """安排查验排期（海关审单员逻辑审结通过后安排查验）。"""
     declaration_id: int
+    yard_id: int
+    bay_id: int
+    inspector_id: int
     scheduled_at: datetime
-    port: str
-    bay: str = ""
+    duration_minutes: int = Field(default=120, ge=30, le=480)
+    reason: str = ""
+    confirm: bool = False  # 超营业窗口/确认冲突强制落位时须二次确认
+
+
+class InspectionRescheduleIn(BaseModel):
+    """甘特拖拽改期：只改时间或连车位/查验员一起换。"""
+    scheduled_at: datetime
+    bay_id: Optional[int] = None
+    inspector_id: Optional[int] = None
+    reason: str = Field(default="", max_length=400)
+    confirm: bool = False  # 落点超窗口或存在冲突时须二次确认填原因
+
+
+class ReassignIn(BaseModel):
+    """改派：车故障/人请假，从当前单解绑重派，并链式顺延后续单。"""
+    reason: str = Field(min_length=4, max_length=400, description="改派原因，如：查验台位故障/查验员请假")
+    new_bay_id: Optional[int] = None
+    new_inspector_id: Optional[int] = None
+    new_scheduled_at: Optional[datetime] = None
+    confirm: bool = False  # False=只做预演(dry-run)；True=确认执行
+
+
+class InspectionCancelIn(BaseModel):
+    reason: str = Field(min_length=4, max_length=300)
+
+
+class InspectionFinishIn(BaseModel):
+    result: str = "查验无误"
+    abnormal: bool = False
 
 
 # ---------- 输出序列化 ----------
@@ -90,6 +122,9 @@ def user_out(u) -> dict:
         "enterprise_id": u.enterprise_id,
         "enterprise_name": u.enterprise.name_short if u.enterprise else None,
         "port": u.port or None,
+        "qualifications": getattr(u, "qual_list", []) if u.role == Role.INSPECTOR else [],
+        "qual_labels": [QUAL_LABELS.get(q, q) for q in getattr(u, "qual_list", [])],
+        "on_leave": bool(getattr(u, "on_leave", False)),
     }
 
 
@@ -167,23 +202,57 @@ def declaration_out(d, *, can_see_full_name: bool = False) -> dict:
         "remark": d.remark,
         "entrust_time": d.entrust_time.isoformat(timespec="seconds"),
         "updated_at": d.updated_at.isoformat(timespec="seconds"),
-        "inspection": inspection_out(d.inspections[-1]) if d.inspections else None,
+        "inspection": active_inspection_out(d),
     }
 
 
+def active_inspection_out(d) -> dict | None:
+    """当前生效查验排期：优先未取消的最新一条；全部取消则返回 None（前端据此渲染「排期全取消」空态）。"""
+    active = [i for i in d.inspections if i.status != "cancelled"]
+    if active:
+        return inspection_out(active[-1])
+    return None
+
+
 def inspection_out(i) -> dict:
+    from .models import BAY_KIND_LABELS, QUAL_LABELS
     return {
         "id": i.id,
         "declaration_id": i.declaration_id,
         "decl_no": i.declaration.decl_no,
+        "enterprise_id": i.declaration.enterprise_id,
         "enterprise_name": i.declaration.enterprise.name_short,
+        "decl_status": i.declaration.status.value,
+        "decl_status_label": STATUS_LABELS[i.declaration.status],
         "scheduled_at": i.scheduled_at.isoformat(timespec="minutes"),
-        "port": i.port,
-        "bay": i.bay,
+        "scheduled_end": i.end_time.isoformat(timespec="minutes"),
+        "duration_minutes": i.duration_minutes or 120,
+        "due_date": i.due_date.isoformat(timespec="minutes") if i.due_date else None,
+        "started_at": i.started_at.isoformat(timespec="minutes") if i.started_at else None,
+        "finished_at": i.finished_at.isoformat(timespec="minutes") if i.finished_at else None,
+        "port": i.yard.port if i.yard else (getattr(i, "port", "") or ""),
+        "yard_id": i.yard_id,
+        "yard_name": i.yard.name if i.yard else None,
+        "bay_id": i.bay_id,
+        "bay_code": i.bay.code if i.bay else "",
+        "bay_kind": i.bay.kind if i.bay else "general",
+        "bay_kind_label": BAY_KIND_LABELS.get(i.bay.kind, "普货台位") if i.bay else "普货台位",
+        "inspector_id": i.inspector_id,
+        "inspector_name": i.inspector.display_name if i.inspector else None,
+        "inspector_on_leave": bool(i.inspector.on_leave) if i.inspector else False,
+        "required_qual": i.required_qual,
+        "required_qual_label": QUAL_LABELS.get(i.required_qual, "") if i.required_qual else "",
         "status": i.status,
-        "status_label": {"pending": "待查验", "inspecting": "查验中", "done": "已完成", "abnormal": "异常"}.get(i.status, i.status),
+        "status_label": {
+            "pending": "待查验", "inspecting": "查验中", "done": "已完成",
+            "abnormal": "异常", "cancelled": "已取消",
+        }.get(i.status, i.status),
         "result_note": i.result_note,
+        "cancel_reason": i.cancel_reason or None,
         "cargo_name": i.declaration.cargo_name,
+        "hs_code": i.declaration.hs_code,
+        "reassign_count": i.reassign_count or 0,
+        "chain_batch": i.chain_batch,
     }
 
 

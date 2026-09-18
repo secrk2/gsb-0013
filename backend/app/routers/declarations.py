@@ -24,7 +24,7 @@ from ..models import (
     DeclStatus, BizError, guard_transition,
 )
 from ..schemas import (
-    DeclarationCreateIn, AssignBrokerIn, TransitionIn, TaxPayIn, InspectionCreateIn,
+    DeclarationCreateIn, AssignBrokerIn, TransitionIn, TaxPayIn,
     declaration_out, event_out, inspection_out,
 )
 from ..deps import get_current_user, require_roles, load_declaration_scoped, ensure_active_contract
@@ -241,6 +241,8 @@ def get_declaration(decl_id: int,
         },
         "contract_no": decl.enterprise and db.get(Contract, decl.contract_id).contract_no,
         "events": [event_out(e) for e in decl.events],
+        # 全部查验记录（含已取消）：前端据此区分「该单无排期」与「排期全部取消」两种空态
+        "inspections": [inspection_out(i) for i in decl.inspections],
         "allowed_actions": allowed_actions_for(decl, user),
     }
 
@@ -400,58 +402,14 @@ def pay_tax(decl_id: int, body: TaxPayIn,
     return {"ok": True, "declaration": declaration_out(decl)}
 
 
-# ---------- 查验排期 ----------
+# ---------- 查验排期（写操作在 /api/scheduling 路由；此处保留只读列表与便捷动作） ----------
 
 @router.get("/inspections")
-def list_inspections(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+def list_inspections(status: str | None = None,
+                     user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     q = db.query(Inspection)
     if user.role == Role.ENTERPRISE:
         q = q.join(Declaration).filter(Declaration.enterprise_id == user.enterprise_id)
+    if status:
+        q = q.filter(Inspection.status == status)
     return [inspection_out(i) for i in q.order_by(Inspection.scheduled_at).all()]
-
-
-@router.post("/inspections")
-def create_inspection(body: InspectionCreateIn,
-                      user: User = Depends(require_roles(Role.CUSTOMS, Role.SUPERVISOR)),
-                      db: Session = Depends(get_db)):
-    decl = load_declaration_scoped(body.declaration_id, user, db)
-    if decl.status not in (DeclStatus.INSPECTING, DeclStatus.REVIEWING):
-        raise BizError("只有布控查验/审单环节的报关单才能排查验计划", code="bad_status_for_inspection")
-    insp = Inspection(
-        declaration_id=decl.id,
-        scheduled_at=body.scheduled_at,
-        port=body.port,
-        bay=body.bay,
-        inspector_id=user.id,
-        status="pending",
-    )
-    db.add(insp)
-    if decl.status == DeclStatus.REVIEWING:
-        guard_transition(decl.status, DeclStatus.INSPECTING, user.role)
-        _apply_transition(db, decl, user, DeclStatus.REVIEWING, DeclStatus.INSPECTING, "布控查验并排期")
-    db.commit()
-    db.refresh(insp)
-    return {"ok": True, "inspection": inspection_out(insp)}
-
-
-@router.post("/inspections/{insp_id}/finish")
-def finish_inspection(insp_id: int, result: str = "查验无误", abnormal: bool = False,
-                      user: User = Depends(get_current_user),
-                      db: Session = Depends(get_db)):
-    insp = db.get(Inspection, insp_id)
-    if not insp:
-        raise BizError("查验任务不存在", code="not_found", status_code=404)
-    decl = load_declaration_scoped(insp.declaration_id, user, db)
-    if user.role != Role.CUSTOMS:
-        raise BizError("仅海关审单员可登记查验结果", code="role_forbidden", status_code=403)
-    insp.status = "abnormal" if abnormal else "done"
-    insp.result_note = result
-    db.commit()
-    db.refresh(insp)
-    return {"ok": True, "inspection": inspection_out(insp),
-            "hint": "查验结果已登记，可在报关单上执行放行或转重审。"}
-
-
-# 延迟引用避免循环感
-def require_roles_customs():
-    return require_roles(Role.CUSTOMS, Role.SUPERVISOR)
